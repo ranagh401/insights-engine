@@ -1,0 +1,74 @@
+name: Deploy to VM
+
+# Deploys the service source to the target VM over SSH, then restarts it.
+# Runs after CI passes on main, or manually via the Actions tab.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   VM_HOST         e.g. 20.244.108.100
+#   VM_USER         e.g. webadmin
+#   VM_SSH_KEY      private key (the PUBLIC half must be in the VM's ~/.ssh/authorized_keys)
+#   VM_PATH         absolute path to the repo on the VM, e.g. /home/webadmin/ms-insights-portal-crm
+# Required repository variable:
+#   VM_RESTART_CMD  command that restarts the service on the VM, e.g.
+#                     sudo systemctl restart ms-insights-crm
+#                   or  docker restart ms-insights-crm
+#   VM_HEALTH_URL   (optional) URL to curl after restart, e.g. http://localhost:8010/docs
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-vm
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Only deploy when the triggering CI run succeeded (or on manual dispatch).
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "${{ secrets.VM_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Sync source to VM
+        # Note: --delete is intentionally NOT used, so untracked files on the
+        # VM (including its .env) are preserved. .env is excluded regardless.
+        run: |
+          rsync -az \
+            --exclude '.git' \
+            --exclude '.github' \
+            --exclude '.env' \
+            --exclude '.venv' \
+            --exclude '__pycache__' \
+            --exclude 'data/' \
+            -e "ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=accept-new" \
+            ./ "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:${{ secrets.VM_PATH }}/"
+
+      - name: Restart service
+        run: |
+          ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=accept-new \
+            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
+            "${{ vars.VM_RESTART_CMD }}"
+
+      - name: Health check
+        if: vars.VM_HEALTH_URL != ''
+        run: |
+          ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=accept-new \
+            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
+            "for i in \$(seq 1 15); do \
+               code=\$(curl -s -o /dev/null -w '%{http_code}' -m 3 '${{ vars.VM_HEALTH_URL }}' || true); \
+               if [ \"\$code\" = '200' ]; then echo \"healthy (\$code)\"; exit 0; fi; \
+               sleep 2; \
+             done; echo 'health check failed'; exit 1"

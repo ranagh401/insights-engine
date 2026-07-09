@@ -1,0 +1,257 @@
+trigger:
+  branches:
+    include:
+      - env/uat
+      - env/prod
+
+resources:
+  pipelines:
+  - pipeline: ci
+    source: ms-renuity-insights-portal-ci
+
+    trigger:
+      branches:
+        include:
+          - env/local
+
+#################
+# DEV Environment
+#################
+stages:
+- stage: DEV
+  displayName: Deploy to DEV
+  condition: |
+    and(
+      succeeded(),
+      eq(variables['Build.Reason'], 'ResourceTrigger'),
+      eq(variables['resources.pipeline.ci.sourceBranch'], 'refs/heads/env/local')
+    )
+  variables:
+    - group: ms-renuity-insights-portal-1platform-dev
+    - name: NAMESPACE
+      value: dev
+  jobs:
+  - deployment: DeployDev
+    displayName: DEV Deployment
+    environment: dev
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+            persistCredentials: true
+
+          - script: |
+              git fetch origin env/local
+              git checkout env/local
+              git pull
+              source deploy/image-version.env
+              IMAGE_FULL=$ACR_NAME/$IMAGE_NAME:$IMAGE_TAG
+              echo "Deploying image: $IMAGE_FULL"
+              echo "##vso[task.setvariable variable=IMAGE_FULL]$IMAGE_FULL"
+            displayName: Read image version
+
+          - script: |
+              set -e
+              cp k8s/generate-env-configmap.yaml k8s/env-configmap.yaml
+              sed -i "s|{{NAMESPACE}}|$(NAMESPACE)|g" k8s/env-configmap.yaml
+
+              escape() {
+                printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+              }
+
+              for v in \
+                 ONEPLATFORM_APP__NAME \
+                ONEPLATFORM_APP__VERSION \
+                ONEPLATFORM_APP__ENVIRONMENT \
+                ONEPLATFORM_APP__DEBUG \
+                ONEPLATFORM_SERVICE__NAME \
+                ONEPLATFORM_SERVICE__VERSION \
+                ONEPLATFORM_SERVICE__PORT \
+                ONEPLATFORM_SERVICE__GRPC_PORT \
+                ONEPLATFORM_SQLSERVER__CONN_STR \
+                ONEPLATFORM_OPENAI__API_KEY \
+                ONEPLATFORM_OPENAI__ENDPOINT \
+                ONEPLATFORM_OPENAI__API_VERSION \
+                ONEPLATFORM_OPENAI__DEPLOYMENT \
+                ONEPLATFORM_OPENAI__TEMPERATURE \
+                ONEPLATFORM_DATABRICKS__HOST \
+                ONEPLATFORM_DATABRICKS__TOKEN \
+                ONEPLATFORM_DATABRICKS__WAREHOUSE_ID \
+                ONEPLATFORM_DATABRICKS__CATALOG \
+                ONEPLATFORM_DATABRICKS__SCHEMA_NAME \
+                ONEPLATFORM_DATABASE__URL \
+                ONEPLATFORM_DATABASE__SCHEMA \
+                ONEPLATFORM_REDIS__URL \
+                ONEPLATFORM_JWT__JWT_SECRET \
+                ONEPLATFORM_JWT__ALGORITHM \
+                ONEPLATFORM_JWT__ISSUER \
+                ONEPLATFORM_MESSAGE_BROKER__URL \
+                AZURE_TENANT_ID \
+                AZURE_CLIENT_ID \
+                PBI_WORKSPACE_ID \
+                PBI_DATASET_ID \
+                DATE_TABLE_NAME \
+                DATE_COLUMN_NAME \
+                PBI_MAX_CONCURRENT_QUERIES \
+                PBI_RETRY_MAX_ATTEMPTS \
+                PBI_DAX_READ_TIMEOUT_SECONDS \
+                INSIGHTS_ANTHROPIC_FOUNDRY__BASE_URL \
+                INSIGHTS_ANTHROPIC_FOUNDRY__DEPLOYMENT \
+                INSIGHTS_ANTHROPIC_OPUS__BASE_URL \
+                INSIGHTS_ANTHROPIC_OPUS__DEPLOYMENT
+              do
+                val="$(escape "${!v}")"
+                sed -i "s|{{$v}}|$val|g" k8s/env-configmap.yaml
+              done
+            displayName: Generate ConfigMap
+
+          - task: Kubernetes@1
+            displayName: Apply ConfigMap
+            inputs:
+              connectionType: Kubernetes Service Connection
+              kubernetesServiceEndpoint: $(K8S_CONNECTION)
+              namespace: $(NAMESPACE)
+              command: apply
+              useConfigurationFile: true
+              configuration: k8s/env-configmap.yaml
+
+          - script: |
+              cp k8s/generate-env-secret.yaml k8s/env-secret.yaml
+              sed -i "s|{{NAMESPACE}}|$(NAMESPACE)|g" k8s/env-secret.yaml
+
+              escape() {
+                printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+              }
+
+              sed -i "s|{{ONEPLATFORM_DATABASE__URL}}|$(escape "$ONEPLATFORM_DATABASE__URL")|g" k8s/env-secret.yaml
+              sed -i "s|{{ONEPLATFORM_JWT__JWT_SECRET}}|$(escape "$ONEPLATFORM_JWT__JWT_SECRET")|g" k8s/env-secret.yaml
+              sed -i "s|{{ONEPLATFORM_SQLSERVER__CONN_STR}}|$(escape "$ONEPLATFORM_SQLSERVER__CONN_STR")|g" k8s/env-secret.yaml
+              sed -i "s|{{ONEPLATFORM_DATABRICKS__TOKEN}}|$(escape "$ONEPLATFORM_DATABRICKS__TOKEN")|g" k8s/env-secret.yaml
+              sed -i "s|{{ONEPLATFORM_OPENAI__API_KEY}}|$(escape "$ONEPLATFORM_OPENAI__API_KEY")|g" k8s/env-secret.yaml
+              sed -i "s|{{INSIGHTS_ANTHROPIC_FOUNDRY__API_KEY}}|$(escape "$INSIGHTS_ANTHROPIC_FOUNDRY__API_KEY")|g" k8s/env-secret.yaml
+              sed -i "s|{{INSIGHTS_ANTHROPIC_OPUS__API_KEY}}|$(escape "$INSIGHTS_ANTHROPIC_OPUS__API_KEY")|g" k8s/env-secret.yaml
+              sed -i "s|{{AZURE_CLIENT_SECRET}}|$(escape "$AZURE_CLIENT_SECRET")|g" k8s/env-secret.yaml
+              sed -i "s|{{POSTGRES_DSN}}|$(escape "$POSTGRES_DSN")|g" k8s/env-secret.yaml
+            displayName: Generate Secret
+
+          - task: Kubernetes@1
+            displayName: Apply Secret
+            inputs:
+              connectionType: Kubernetes Service Connection
+              kubernetesServiceEndpoint: $(K8S_CONNECTION)
+              namespace: $(NAMESPACE)
+              command: apply
+              useConfigurationFile: true
+              configuration: k8s/env-secret.yaml
+
+          - task: Kubernetes@1
+            displayName: 'Apply Service (idempotent)'
+            inputs:
+              connectionType: 'Kubernetes Service Connection'
+              kubernetesServiceEndpoint: '$(K8S_CONNECTION)'
+              namespace: '$(NAMESPACE)'
+              command: 'apply'
+              arguments: '-f k8s/service.yaml'
+
+          - script: |
+              sed -i "s|image:.*|image: $(IMAGE_FULL)|g" k8s/deployment.yaml
+            displayName: 'Inject Image'
+
+          - task: Kubernetes@1
+            displayName: 'Deploy to AKS'
+            inputs:
+              connectionType: 'Kubernetes Service Connection'
+              kubernetesServiceEndpoint: '$(K8S_CONNECTION)'
+              namespace: '$(NAMESPACE)'
+              command: 'apply'
+              arguments: '-f k8s/deployment.yaml'
+
+          - task: Kubernetes@1
+            displayName: 'Verify Rollout'
+            inputs:
+              connectionType: 'Kubernetes Service Connection'
+              kubernetesServiceEndpoint: '$(K8S_CONNECTION)'
+              namespace: '$(NAMESPACE)'
+              command: 'rollout'
+              arguments: 'status deployment/ms-renuity-insights-portal-1platform --timeout=60s'
+
+#################
+# UAT Environment
+#################
+- stage: UAT
+  displayName: Deploy to UAT
+  condition: eq(variables['Build.SourceBranchName'], 'env/uat')
+  variables:
+    - group: ms-renuity-insights-portal-1platform-uat
+    - name: NAMESPACE
+      value: uat
+  jobs:
+  - deployment: DeployUAT
+    displayName: UAT Deployment
+    environment: uat
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+            persistCredentials: true
+          - script: |
+              git fetch origin env/uat
+              git checkout env/uat
+              git pull
+              source deploy/image-version.env
+              IMAGE_FULL=$ACR_NAME/$IMAGE_NAME:$IMAGE_TAG
+              echo "##vso[task.setvariable variable=IMAGE_FULL]$IMAGE_FULL"
+            displayName: Read image version
+          - script: |
+              sed -i "s|image:.*|image: $(IMAGE_FULL)|g" k8s/deployment.yaml
+            displayName: Inject Image
+          - task: Kubernetes@1
+            displayName: Deploy to AKS
+            inputs:
+              connectionType: Kubernetes Service Connection
+              kubernetesServiceEndpoint: $(K8S_CONNECTION)
+              namespace: $(NAMESPACE)
+              command: apply
+              arguments: '-f k8s/deployment.yaml'
+
+##################
+# PROD Environment
+##################
+- stage: PROD
+  displayName: Deploy to PROD
+  condition: eq(variables['Build.SourceBranchName'], 'env/prod')
+  variables:
+    - group: ms-renuity-insights-portal-1platform-prod
+    - name: NAMESPACE
+      value: prod
+  jobs:
+  - deployment: DeployProd
+    displayName: PROD Deployment
+    environment: prod
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+            persistCredentials: true
+          - script: |
+              git fetch origin env/prod
+              git checkout env/prod
+              git pull
+              source deploy/image-version.env
+              IMAGE_FULL=$ACR_NAME/$IMAGE_NAME:$IMAGE_TAG
+              echo "##vso[task.setvariable variable=IMAGE_FULL]$IMAGE_FULL"
+            displayName: Read image version
+          - script: |
+              sed -i "s|image:.*|image: $(IMAGE_FULL)|g" k8s/deployment.yaml
+            displayName: Inject Image
+          - task: Kubernetes@1
+            displayName: Deploy to AKS
+            inputs:
+              connectionType: Kubernetes Service Connection
+              kubernetesServiceEndpoint: $(K8S_CONNECTION)
+              namespace: $(NAMESPACE)
+              command: apply
+              arguments: '-f k8s/deployment.yaml'

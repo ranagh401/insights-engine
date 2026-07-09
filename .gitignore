@@ -1,0 +1,412 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+*.pyd
+
+# Distribution / packaging
+.Python
+develop-eggs/
+dist/
+build/
+.build/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+*.whl
+*.tar.gz
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+.parcel-cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+coverage/
+*/pytest-report.html
+lcov.info
+.nyc_output
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Local LLM prompt dumps (default ``INSIGHTS_PROMPT_LOG_DIR`` when unset)
+prompt_logs/
+
+# Ruff
+.ruff_cache/
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/build/
+docs/source/build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# poetry
+poetry.lock
+
+# pdm
+.pdm.toml
+
+# PEP 582
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.env.local
+.env.*.local
+.env.test
+.env.production
+.env.override
+.env.backup.*
+.venv
+.venv/
+env/
+venv/
+*/venv/
+*/.venv/
+python-packages/*/.venv/
+python-packages/*/venv/
+
+ENV/
+env.bak/
+venv.bak/
+
+#data
+data/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+site/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+.vscode-test
+*.code-workspace
+
+# macOS
+.DS_Store
+.DS_Store?
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# Generated protobuf files
+*_pb2.py
+*_pb2_grpc.py
+*_pb2.pyi
+*_pb2_grpc.pyi
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*.swn
+*.bak
+*.backup
+*.old
+*.orig
+
+# Log files
+logs/
+*.log
+runtime.log
+application.log
+error.log
+access.log
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Azure
+.azure/
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# Docker
+.dockerignore
+
+# Certificates
+*.pem
+*.key
+*.crt
+*.csr
+
+# Secrets
+secrets/
+*.secret
+credentials.json
+
+# Project-specific additions
+# Reports and test outputs
+reports
+reports/*
+test-results/
+test-reports/
+coverage-reports/
+benchmark-results/
+
+# IDE and editor files
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# OS generated files
+ehthumbs.db
+Icon?
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Dependency directories
+node_modules/
+jspm_packages/
+
+# Optional npm cache directory
+.npm
+
+# Optional REPL history
+.node_repl_history
+
+# Output of 'npm pack'
+*.tgz
+
+# Yarn Integrity file
+.yarn-integrity
+
+# parcel-bundler cache (https://parceljs.org/)
+.parcel-cache
+
+# next.js build output
+.next
+
+# nuxt.js build output
+.nuxt
+
+# vuepress build output
+.vuepress/dist
+
+# Serverless directories
+.serverless
+
+# FuseBox cache
+.fusebox/
+
+# DynamoDB Local files
+.dynamodb/
+
+# TernJS port file
+.tern-port
+
+# Microservices specific
+# gRPC generated files
+proto/generated/
+**/proto/generated/
+
+# Service mesh configs (generated)
+istio/generated/
+kong/generated/
+
+# Kubernetes manifests (generated)
+k8s/generated/
+kubernetes/generated/
+
+# Helm charts (generated)
+charts/generated/
+
+# Migration files (auto-generated)
+migrations/versions/
+
+# Cache directories
+.cache/
+cache/
+tmp/
+
+# Performance test results
+performance/
+load-test-results/
+
+# Security scan results
+security-reports/
+vulnerability-reports/
+
+# Monitoring and observability
+grafana/data/
+prometheus/data/
+jaeger/data/
+
+# Local development overrides
+docker-compose.override.yml
+docker-compose.local.yml
+
+# Package manager lock files (if using multiple managers)
+uv.lock
+requirements.lock
+
+# Cython generated files
+*.c
+*.cpp
+*.html
+
+# Profiling data
+*.prof
+*.pstats
+
+# Memory profiling
+*.mprof
+
+# Line profiling
+*.lprof
+
+# Benchmarking
+.benchmarks/
+
+# Local configuration overrides
+config/local/
+config/override/
+local.yml
+override.yml
+
+# Socket files
+*.sock
+
+# Core dumps
+core.*
+
+# Backup directories
+backup/
+backups/
+
+# Archive files
+*.zip
+*.tar
+*.tar.bz2
+*.tar.xz
+*.rar
+*.7z
+
+# Temporary directories
+temp/
+temporary/
+/reports/
+
+
+docs
+scripts/

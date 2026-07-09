@@ -1,0 +1,45 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: oneplatform_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: oneplatform_configure
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d oneplatform_configure"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  insights:
+    build:
+      # Build from repo root so sibling folders are in context if needed
+      context: ..
+      dockerfile: ms-insights-portal-renuity/docker/Dockerfile
+      args:
+        SERVICE_DIR: ms-insights-portal-renuity
+    # Use .env for all ONEPLATFORM_* variables
+    env_file:
+      - .env
+    environment:
+      ONEPLATFORM_REDIS__URL: redis://oneplatform_redis:6379/0
+      ONEPLATFORM_ENVIRONMENT: development
+      ONEPLATFORM_DEBUG: "true"
+      ONEPLATFORM_MESSAGE_BROKER__URL: amqp://guest:guest@oneplatform_rabbitmq:5672/
+    ports:
+      # Host :8009 unchanged for local dev; container still uses Dockerfile port 8016
+      - "8009:8016"
+      - "50055:50055"   # gRPC
+    networks:
+      - oneplatform_net
+
+networks:
+  oneplatform_net:
+    external: true
+    name: microservice-api-gateway_oneplatform_net

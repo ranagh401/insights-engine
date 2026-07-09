@@ -1,0 +1,78 @@
+trigger:
+  branches:
+    include:
+      - env/local
+
+# Single checkout only. A second checkout (microservice-shared) makes Azure put each
+# repo under s/<repo-name>/, so $(Build.SourcesDirectory) is not the service root and
+# ./docker/Dockerfile is missing. The Docker build does not need shared in context.
+
+stages:
+- stage: Build
+  displayName: Build Docker Image
+  jobs:
+  - job: BuildImage
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+      persistCredentials: true
+
+    # ----------------------------
+    # Generate immutable image tag
+    # ----------------------------
+    - script: |
+        if [[ "$(Build.SourceBranch)" == "refs/heads/env/local" ]]; then
+          TAG="$(Build.BuildId)"
+        elif [[ "$(Build.SourceBranch)" == "refs/heads/main" ]]; then
+          TAG="hotfix-$(Build.BuildId)"
+        else
+          echo "No build required"
+          exit 0
+        fi
+        echo "##vso[task.setvariable variable=IMAGE_TAG]$TAG"
+      displayName: Generate image tag
+    
+    # -------------------------
+    # Build & Push image
+    # -------------------------
+    - task: Docker@2
+      displayName: Build & Push Image
+      inputs:
+        containerRegistry: $(ACR_SERVICE_CONNECTION)
+        repository: $(IMAGE_NAME)
+        command: buildAndPush
+        # Repo checkout is ms-renuity-insights-portal root — Dockerfile lives at ./docker/Dockerfile
+        Dockerfile: ./docker/Dockerfile
+        buildContext: $(Build.SourcesDirectory)
+        tags: |
+          $(IMAGE_TAG)
+
+    # -------------------------
+    # Write image version for promotion
+    # -------------------------
+    - script: |
+        cd $(Build.SourcesDirectory)
+        mkdir -p deploy
+        echo "IMAGE_NAME=$(IMAGE_NAME)" > deploy/image-version.env
+        echo "IMAGE_TAG=$(IMAGE_TAG)" >> deploy/image-version.env
+        echo "ACR_NAME=$(ACR_NAME)" >> deploy/image-version.env
+        cat deploy/image-version.env
+      displayName: Write image version file
+
+    # -------------------------
+    # Commit image version to env/local
+    # -------------------------
+    - script: |
+        cd $(Build.SourcesDirectory)
+
+        git fetch origin env/local
+        git checkout env/local
+
+        git config user.email "azure-pipeline@1platform.com"
+        git config user.name "Azure Pipeline"
+
+        git add deploy/image-version.env
+        git commit -m "ci: update image version [skip ci]" || echo "Nothing to commit"
+        git push origin env/local
+      displayName: Commit image version

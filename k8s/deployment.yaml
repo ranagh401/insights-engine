@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ms-renuity-insights-portal-1platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ms-renuity-insights-portal-1platform
+  template:
+    metadata:
+      labels:
+        app: ms-renuity-insights-portal-1platform
+    spec:
+      containers:
+      - name: ms-renuity-insights-portal-1platform
+        imagePullPolicy: Always
+        image: placeholder   # overridden by pipeline
+        envFrom:
+          - secretRef:
+              name: ms-renuity-insights-portal-env
+          - configMapRef:
+              name: ms-renuity-insights-portal-config
+        ports:
+        # Must match Dockerfile / Service targetPort (uvicorn --port 8016)
+        - containerPort: 8016
