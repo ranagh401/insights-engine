@@ -212,6 +212,16 @@ def _parse_explicit_period(
     return period_start, period_end
 
 
+class GroupBestInsight(BaseModel):
+    heading: Optional[str] = Field(
+        None, description="Group insight title, wrapped in /h ... /h markers for the frontend."
+    )
+    description: Optional[str] = Field(
+        None,
+        description="Plain-text insight synthesized across ALL of the group's insights.",
+    )
+
+
 class ExecutiveSummaryBucket(BaseModel):
     period: Optional[str] = None
     period_start: Optional[str] = None
@@ -219,7 +229,15 @@ class ExecutiveSummaryBucket(BaseModel):
     insight_count: int = 0
     pointers: list[str] = Field(
         default_factory=list,
-        description="Five LLM-generated bullets (max 10 words each) from maininsightscrm rows",
+        description="Five LLM-generated pointers with inline /green or /red color markers.",
+    )
+    best_insight: Optional[GroupBestInsight] = Field(
+        None,
+        description="Only when a group is requested: one insight synthesized from all the group's insights.",
+    )
+    recommended_action: Optional[str] = Field(
+        None,
+        description="Only when a group is requested: one LLM-generated recommended action for the group.",
     )
 
 
@@ -229,8 +247,28 @@ class ExecutiveSummaryResponse(BaseModel):
         None,
         description="Echo of request: monthly, weekly, or null when both were returned.",
     )
+    group: Optional[str] = Field(
+        None,
+        description="Echo of request: the KPI-card group (group1..group5), or null for overall.",
+    )
     monthly: Optional[ExecutiveSummaryBucket] = None
     weekly: Optional[ExecutiveSummaryBucket] = None
+
+
+class FinalSummaryResponse(BaseModel):
+    group: Optional[str] = Field(None, description="Echo of the requested group, or null for overall.")
+    source: str = Field(
+        ..., description="'stored' when read from insights.finalcrm, 'generated' when built via LLM."
+    )
+    run_timestamp: Optional[datetime] = None
+    executive_summary: list[str] = Field(
+        default_factory=list,
+        description="Executive summary pointers (each may carry an inline /green or /red marker).",
+    )
+    insight: Optional[GroupBestInsight] = Field(
+        None, description="Synthesized group insight (heading wrapped in /h ... /h, plus description)."
+    )
+    recommended_action: Optional[str] = Field(None, description="One recommended action for the group.")
 
 
 @router.get(
@@ -607,20 +645,29 @@ async def get_derived_kpis_breakdown(
 
 @router.post(
     "/main-insights/executive-summary",
-    response_model=ExecutiveSummaryResponse,
-    summary="5-pointer executive summary from maininsightscrm (Azure GPT-4o)",
+    response_model=FinalSummaryResponse,
+    summary="Executive summary per group (stored in insights.finalcrm, LLM fallback)",
     description=(
-        "Loads rows from **insights.maininsightscrm** (latest ``run_timestamp`` unless specified), "
-        "then synthesizes a **five-bullet** executive brief per window using **Azure GPT-4o** "
-        "(``ONEPLATFORM_OPENAI__*``).\n\n"
-        "- **weekly** — insights with period ``22-28 Jun`` (CRM default week)\n"
-        "- **monthly** — insights with period ``1-30 Apr``\n"
-        "- omit ``period_type`` → both buckets when data exists\n\n"
-        "Each pointer is at most **10 words**."
+        "Returns the precomputed executive summary for a KPI-card group from "
+        "**insights.finalcrm** (keyed by group; 'overall' for no group). "
+        "``source='stored'`` when served from the table (no LLM call). "
+        "When no row exists, falls back to an on-the-fly Azure GPT-4o summary "
+        "(``source='generated'``).\n\n"
+        "Response: ``executive_summary`` (pointer list with /green|/red markers), "
+        "``insight`` (heading in /h ... /h + description), ``recommended_action``."
     ),
 )
 async def post_main_insights_executive_summary(
     period_type: PeriodTypeQuery = None,
+    group: Optional[str] = Query(
+        None,
+        description=(
+            "KPI-card group to scope the summary to, e.g. group1..group5. "
+            "Omit for an overall summary. When set, only maininsightscrm rows "
+            "whose manual 'group_name' column equals this group are summarized, "
+            "and a best_insight + recommended_action are appended per bucket."
+        ),
+    ),
     run_timestamp: Optional[datetime] = Query(
         None,
         description="Batch used for period metadata. Defaults to latest main_insights run_timestamp.",
@@ -632,33 +679,67 @@ async def post_main_insights_executive_summary(
     ),
     store: ResultStore = Depends(get_result_store),
 ):
-    """LLM executive summary from ``insights.maininsightscrm`` via Azure GPT-4o."""
+    """Executive summary for a KPI-card group.
+
+    Reads the precomputed row from ``insights.finalcrm`` (keyed by group, with
+    'overall' for no group). Falls back to an on-the-fly Azure GPT-4o summary
+    only when no stored row exists.
+    """
     store = _select_main_insights_store(store, main_insights_table)
+    group_val = (group or "").strip() or None
+    lookup_key = group_val or "overall"
     logger.info(
-        "POST /pbi/portal/main-insights/executive-summary period_type=%s run_timestamp=%s limit=%s",
+        "POST /pbi/portal/main-insights/executive-summary group=%s (lookup=%s) period_type=%s",
+        group_val,
+        lookup_key,
         period_type.value if period_type else None,
-        run_timestamp,
-        limit,
     )
+
+    # 1) Stored (no LLM call).
+    try:
+        stored = await store.get_finalcrm_by_group(lookup_key)
+    except Exception:
+        stored = None
+    if stored and any(
+        stored.get(k) for k in ("executive_summary", "insight", "recommended_action")
+    ):
+        es = stored.get("executive_summary")
+        ins = stored.get("insight")
+        return FinalSummaryResponse(
+            group=group_val,
+            source="stored",
+            executive_summary=es if isinstance(es, list) else [],
+            insight=GroupBestInsight(**ins) if isinstance(ins, dict) else None,
+            recommended_action=stored.get("recommended_action"),
+        )
+
+    # 2) LLM fallback — generate, then flatten the relevant period bucket.
     try:
         engine = InsightEngine(store, main_insights_llm=MainInsightsNarrativeModel.azure_default)
         result = await engine.summarize_main_insights_executive_split(
             run_timestamp=run_timestamp,
             limit=limit,
             period_type=period_type.value if period_type else None,
-        )
-        monthly_data = result.get("monthly")
-        weekly_data = result.get("weekly")
-        return ExecutiveSummaryResponse(
-            run_timestamp=result.get("run_timestamp"),
-            period_type=period_type.value if period_type else None,
-            monthly=ExecutiveSummaryBucket(**monthly_data) if monthly_data else None,
-            weekly=ExecutiveSummaryBucket(**weekly_data) if weekly_data else None,
+            group=group_val,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+    pt = period_type.value if period_type else None
+    bucket = (
+        result.get("monthly") if pt == "monthly" else result.get("weekly")
+    ) or result.get("weekly") or result.get("monthly") or {}
+    ins = bucket.get("best_insight")
+    return FinalSummaryResponse(
+        group=group_val,
+        source="generated",
+        run_timestamp=result.get("run_timestamp"),
+        executive_summary=bucket.get("pointers", []),
+        insight=GroupBestInsight(**ins) if isinstance(ins, dict) else None,
+        recommended_action=bucket.get("recommended_action"),
+    )
 
 
 @router.get(

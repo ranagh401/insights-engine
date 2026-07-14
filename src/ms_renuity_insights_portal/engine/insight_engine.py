@@ -2707,6 +2707,97 @@ Rules:
 _EXECUTIVE_SUMMARY_MAX_WORDS = 10
 _EXECUTIVE_SUMMARY_POINTER_COUNT = 5
 
+# Colored variant: each pointer is a full sentence with a neutral lead clause,
+# then a single /green or /red marker before the emphasized (good/bad) clause.
+_EXECUTIVE_SUMMARY_COLORED_SYSTEM_PROMPT = """You are a CFO-facing executive brief writer.
+
+You receive main business insights for ONE reporting window (monthly OR weekly),
+optionally scoped to a single theme (a KPI group). Synthesize them into ONE
+cross-cutting brief for that window only.
+
+Return ONLY valid JSON with exactly this shape:
+{"pointers": ["...", "...", "...", "...", "..."]}
+
+Each pointer is ONE sentence with TWO parts:
+1. A neutral factual lead (plain, no color).
+2. Then exactly ONE marker — /green or /red — immediately before the emphasized
+   clause that should be color-highlighted on the dashboard.
+   - Use /red when the emphasized clause is bad news, a risk, or a negative trend.
+   - Use /green when it is good news, an improvement, or a positive trend.
+
+Example pointers (note the single inline marker):
+"$9.94M pipeline is really $1.71M — only 17% moved a stage. /red 83% not moving, up from 79% last week."
+"$390K OEM funding sits untapped across 11 deals. /green A closing lever, ready to act on."
+
+Rules:
+- Exactly 5 strings in the pointers array (no more, no fewer).
+- Exactly ONE /green or /red marker per pointer, before the emphasized clause.
+- Each pointer at most 30 words. Plain business English; no markdown, no bullet chars.
+- Be specific with numbers where the input provides them.
+- Cover the most important themes across ALL insights in this window/scope.
+"""
+
+_EXECUTIVE_SUMMARY_COLORED_MAX_WORDS = 30
+_COLOR_MARKERS = ("/green", "/red")
+
+
+def _normalize_executive_pointers_colored(raw: Any) -> list[str]:
+    """Preserve the inline /green or /red marker; cap words; pad to five."""
+    if not isinstance(raw, list):
+        raise ValueError("Executive summary JSON must include a pointers array")
+    cleaned: list[str] = []
+    for p in raw:
+        s = str(p).strip()
+        if not s:
+            continue
+        s = _limit_words(s, _EXECUTIVE_SUMMARY_COLORED_MAX_WORDS)
+        # Guarantee a marker so the frontend always has something to color.
+        if not any(m in s for m in _COLOR_MARKERS):
+            s = f"{s} /red"
+        cleaned.append(s)
+    while len(cleaned) < _EXECUTIVE_SUMMARY_POINTER_COUNT:
+        cleaned.append("No additional cross-cutting theme identified. /red")
+    return cleaned[:_EXECUTIVE_SUMMARY_POINTER_COUNT]
+
+
+# Group insight: when a KPI card is clicked, synthesize ONE combined insight that
+# incorporates ALL of the group's insights, plus one recommended action.
+# Heading is wrapped in /h ... /h markers.
+_GROUP_HIGHLIGHT_SYSTEM_PROMPT = """You are a CFO-facing analyst.
+
+You receive ALL business insights for ONE KPI group (a single dashboard card).
+Synthesize them into ONE combined insight that incorporates the key points from
+EVERY insight provided. Do NOT pick just one and ignore the rest — weave the most
+important facts and numbers from all of them into a single coherent story.
+
+Return ONLY valid JSON with exactly this shape:
+{"heading": "...", "description": "...", "action": "..."}
+
+- heading: a short punchy title for the combined group story, at most 12 words.
+  Plain text, no markdown, no bullet characters, no /h markers (added later).
+- description: 2-4 plain sentences that combine the most important points across
+  ALL the insights; be specific with the numbers present in the input.
+- action: ONE concrete, actionable recommendation for this group as a whole.
+"""
+
+
+def _normalize_group_highlight(raw: Any) -> dict[str, Any] | None:
+    """Wrap the chosen heading in /h markers; return best_insight + action."""
+    if not isinstance(raw, dict):
+        return None
+    heading = str(raw.get("heading", "")).strip()
+    description = str(raw.get("description", "")).strip()
+    action = str(raw.get("action", "")).strip()
+    if not any([heading, description, action]):
+        return None
+    return {
+        "best_insight": {
+            "heading": f"/h {heading} /h" if heading else "",
+            "description": description,
+        },
+        "recommended_action": action,
+    }
+
 
 def _limit_words(text: str, max_words: int) -> str:
     words = [w for w in (text or "").split() if w]
@@ -4827,6 +4918,33 @@ class InsightEngine:
             )
         return blocks
 
+    async def _group_highlight_for_rows(
+        self, rows: list[dict], *, bucket: str
+    ) -> dict[str, Any] | None:
+        """Synthesize ONE combined insight from all a group's insights + an action."""
+        blocks = self._build_executive_summary_blocks(rows)
+        if not blocks:
+            return None
+        user_prompt = (
+            f"KPI group insights ({bucket.upper()}). Synthesize ALL of them into one.\n\n"
+            + "\n".join(blocks)
+        )
+        raw = await self._call_gpt4o(
+            _GROUP_HIGHLIGHT_SYSTEM_PROMPT,
+            user_prompt,
+            context=f"group_highlight_{bucket}",
+            max_tokens=600,
+            temperature=0.2,
+            prompt_log_category="main_insight",
+            prompt_log_subfolder=f"group_highlight_{bucket}",
+        )
+        try:
+            parsed = _parse_narrative_json(raw)
+        except Exception:
+            logger.exception("Group highlight JSON parse failed (%s).", bucket)
+            return None
+        return _normalize_group_highlight(parsed)
+
     async def _executive_summary_for_rows(
         self,
         rows: list[dict],
@@ -4834,6 +4952,7 @@ class InsightEngine:
         bucket: str,
         run_timestamp: datetime,
         period_label: str | None = None,
+        include_group_highlight: bool = False,
     ) -> dict[str, Any]:
         from .portal_period import filter_rows_by_period_label, period_window_from_rows
 
@@ -4860,16 +4979,24 @@ class InsightEngine:
             + "\n".join(blocks)
         )
         raw = await self._call_gpt4o(
-            _EXECUTIVE_SUMMARY_SYSTEM_PROMPT,
+            _EXECUTIVE_SUMMARY_COLORED_SYSTEM_PROMPT,
             user_prompt,
             context=f"executive_summary_{bucket}",
-            max_tokens=800,
+            max_tokens=1000,
             temperature=0.2,
             prompt_log_category="main_insight",
             prompt_log_subfolder=f"executive_summary_{bucket}",
         )
         parsed = _parse_narrative_json(raw)
-        base["pointers"] = _normalize_executive_pointers(parsed.get("pointers"))
+        base["pointers"] = _normalize_executive_pointers_colored(parsed.get("pointers"))
+
+        # When scoped to a KPI-card group, also append one synthesized insight
+        # (heading + description) combining all the group's insights, plus an action.
+        if include_group_highlight:
+            highlight = await self._group_highlight_for_rows(scoped, bucket=bucket)
+            if highlight:
+                base["best_insight"] = highlight["best_insight"]
+                base["recommended_action"] = highlight["recommended_action"]
         return base
 
     async def summarize_main_insights_executive_split(
@@ -4878,8 +5005,15 @@ class InsightEngine:
         run_timestamp: Optional[datetime] = None,
         limit: int = 500,
         period_type: str | None = None,
+        group: str | None = None,
     ) -> dict[str, Any]:
-        """Five GPT-4o pointers (≤10 words each) for portal monthly / weekly windows."""
+        """Five GPT-4o pointers for portal monthly / weekly windows.
+
+        When ``group`` is given, only insights whose manual ``group_name`` column
+        equals that group (a clicked KPI-card group) feed the summary. Otherwise
+        all insights are summarized (overall).
+        """
+        from .portal_kpi_groups import row_in_group
         from .portal_period import (
             PORTAL_MONTHLY_PERIOD_LABEL,
             PORTAL_WEEKLY_PERIOD_LABEL,
@@ -4900,6 +5034,8 @@ class InsightEngine:
             limit=max(1, min(limit, 5000)),
             pascal_case=False,
         )
+        if group:
+            rows = [r for r in rows if row_in_group(r, group)]
         monthly_rows, weekly_rows = split_portal_insight_rows(rows)
         if not weekly_rows and rows:
             monthly_ids = {id(r) for r in monthly_rows}
@@ -4916,6 +5052,7 @@ class InsightEngine:
                 f"'{InsightPeriodBucket.weekly.value}'"
             )
 
+        include_highlight = bool(group)
         monthly = None
         weekly = None
         if want_monthly:
@@ -4924,6 +5061,7 @@ class InsightEngine:
                 bucket="monthly",
                 run_timestamp=ts_used,
                 period_label=PORTAL_MONTHLY_PERIOD_LABEL,
+                include_group_highlight=include_highlight,
             )
         if want_weekly:
             weekly = await self._executive_summary_for_rows(
@@ -4931,6 +5069,7 @@ class InsightEngine:
                 bucket="weekly",
                 run_timestamp=ts_used,
                 period_label=PORTAL_WEEKLY_PERIOD_LABEL,
+                include_group_highlight=include_highlight,
             )
         return {
             "run_timestamp": ts_used,

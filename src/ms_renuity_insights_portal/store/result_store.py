@@ -37,7 +37,7 @@ from sqlalchemy import (
     text,
     update,
 )
-from sqlalchemy.dialects.postgresql import UUID, insert
+from sqlalchemy.dialects.postgresql import JSONB, UUID, insert
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from ..config.models import (
@@ -322,6 +322,8 @@ def _build_main_insights_table(table_name: str, run_idx_name: str) -> Table:
         Column("dislike", Boolean, nullable=True),
         Column("remarks", Text, nullable=True),
         Column("recommended_actions", Text, nullable=True),
+        # Manual KPI-card group tag (e.g. group1..group5) for the executive summary.
+        Column("group_name", Text, nullable=True),
         Index(run_idx_name, "run_timestamp"),
     )
 
@@ -331,6 +333,17 @@ maininsightscrm_table = _build_main_insights_table(
 )
 main_insights_table = _build_main_insights_table(
     MAIN_INSIGHTS_LEGACY_TABLE, "ix_main_insights_run"
+)
+
+# Precomputed executive summary per KPI-card group (avoids an LLM call per request).
+finalcrm_table = Table(
+    "finalcrm",
+    metadata,
+    Column("group_name", Text, primary_key=True),
+    Column("executive_summary", JSONB, nullable=True),
+    Column("insight", JSONB, nullable=True),
+    Column("recommended_action", Text, nullable=True),
+    Column("updated_at", DateTime(timezone=True), server_default=text("now()")),
 )
 main_insightsdev_table = _build_main_insights_table(
     MAIN_INSIGHTS_DEV_TABLE, "ix_main_insightsdev_run"
@@ -1458,6 +1471,18 @@ class ResultStore:
         if pascal_case:
             return _main_insight_row_to_pascal(row)
         return _mapping_to_jsonable(row)
+
+    async def get_finalcrm_by_group(self, group_name: str) -> dict[str, Any] | None:
+        """Precomputed executive summary row for a KPI-card group, or None."""
+        key = (group_name or "").strip().lower()
+        if not key:
+            return None
+        async with self._sf() as session:
+            stmt = select(finalcrm_table).where(
+                func.lower(finalcrm_table.c.group_name) == key
+            )
+            row = (await session.execute(stmt)).mappings().first()
+        return _mapping_to_jsonable(row) if row is not None else None
 
     async def update_main_insight_feedback(
         self, insight_id: PyUUID, updates: dict[str, Any]

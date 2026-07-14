@@ -54,7 +54,10 @@ class DAXQueryBuilder:
         self._group_by: list[DimensionRef] = []
         self._treatas_filters: list[tuple] = []
         self._exclusion_filters: list[tuple[DimensionRef, list[str]]] = []
-        self._having: list[tuple[str, float, Optional[float]]] = []
+        # (alias, operator, value, value2) — value filter on a measure column
+        self._having: list[tuple[str, str, float, Optional[float]]] = []
+        # (alias, measure_expr) — extra measures added purely to filter on them
+        self._extra_measures: list[tuple[str, str]] = []
 
     def _clone(self) -> DAXQueryBuilder:
         new = DAXQueryBuilder()
@@ -64,6 +67,7 @@ class DAXQueryBuilder:
         new._treatas_filters = list(self._treatas_filters)
         new._exclusion_filters = list(self._exclusion_filters)
         new._having = list(self._having)
+        new._extra_measures = list(self._extra_measures)
         return new
 
     def with_kpi(self, measure_name: str, alias: str = "KPI Value") -> DAXQueryBuilder:
@@ -114,15 +118,30 @@ class DAXQueryBuilder:
         return self.add_member_filter(dim, [entity_value])
 
     def add_having(
-        self, operator: str, value: float, value2: Optional[float] = None
+        self,
+        operator: str,
+        value: float,
+        value2: Optional[float] = None,
+        alias: Optional[str] = None,
     ) -> DAXQueryBuilder:
-        """Filter on the computed measure value (a HAVING clause).
+        """Filter on a computed measure value (a HAVING clause).
 
         ``operator`` is one of ``gt | lt | gte | lte | eq | ne | between``.
         ``between`` uses both ``value`` (low) and ``value2`` (high), inclusive.
+        ``alias`` selects which measure column to test; defaults to the main KPI.
         """
         c = self._clone()
-        c._having = c._having + [(operator, value, value2)]
+        c._having = c._having + [(alias or self._measure_alias, operator, value, value2)]
+        return c
+
+    def with_extra_measure(self, alias: str, measure_expr: str) -> DAXQueryBuilder:
+        """Add a measure column used only for filtering (e.g. a different KPI).
+
+        The column is emitted in SUMMARIZECOLUMNS so a HAVING predicate can
+        reference it, then stripped from the API response by the caller.
+        """
+        c = self._clone()
+        c._extra_measures = c._extra_measures + [(alias, measure_expr)]
         return c
 
     _HAVING_OPS = {
@@ -136,15 +155,14 @@ class DAXQueryBuilder:
     }
 
     def _having_predicate(self) -> str:
-        alias = f"[{self._measure_alias}]"
         parts: list[str] = []
-        for op, v, v2 in self._having:
+        for alias, op, v, v2 in self._having:
             fn = self._HAVING_OPS.get(op)
             if fn is None:
                 raise ValueError(f"Unsupported having operator: {op!r}")
             if op == "between" and v2 is None:
                 raise ValueError("'between' operator requires value2")
-            parts.append(fn(alias, v, v2))
+            parts.append(fn(f"[{alias}]", v, v2))
         return " && ".join(parts)
 
     def build(self) -> str:
@@ -190,6 +208,8 @@ class DAXQueryBuilder:
             )
 
         sc_args.append(f'"{self._measure_alias}", {self._measure}')
+        for alias, expr in self._extra_measures:
+            sc_args.append(f'"{alias}", {expr}')
 
         # Indent the SUMMARIZECOLUMNS block one extra level when it is wrapped
         # in FILTER(...) for a HAVING clause.
