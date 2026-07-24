@@ -345,6 +345,35 @@ finalcrm_table = Table(
     Column("recommended_action", Text, nullable=True),
     Column("updated_at", DateTime(timezone=True), server_default=text("now()")),
 )
+# Single-row state: the reporting period the weekly refresh last applied. The frontend
+# reads this via GET /pbi/portal/current-period instead of hardcoding the window, so a
+# cron DB write is enough — no frontend rebuild per run.
+portal_current_period_table = Table(
+    "portal_current_period",
+    metadata,
+    Column("id", Integer, primary_key=True),  # always 1
+    Column("period_start", Date, nullable=False),
+    Column("period_end", Date, nullable=False),
+    Column("period_label", Text, nullable=True),
+    Column("updated_at", DateTime(timezone=True), server_default=text("now()")),
+)
+
+# Same as finalcrm, but one row per (sales rep, KPI-card group). Rep-level narrative is
+# built from signal_log, which is the only place sales_rep-sliced data exists —
+# maininsightscrm carries no dimension_name='sales_rep' rows.
+finalcrmsalesrep_table = Table(
+    "finalcrmsalesrep",
+    metadata,
+    Column("sales_rep", Text, primary_key=True),
+    Column("group_name", Text, primary_key=True),
+    Column("executive_summary", JSONB, nullable=True),
+    Column("insight", JSONB, nullable=True),
+    Column("recommended_action", Text, nullable=True),
+    Column("signal_count", Integer, nullable=True),
+    Column("updated_at", DateTime(timezone=True), server_default=text("now()")),
+    Index("ix_finalcrmsalesrep_rep", "sales_rep"),
+)
+
 main_insightsdev_table = _build_main_insights_table(
     MAIN_INSIGHTS_DEV_TABLE, "ix_main_insightsdev_run"
 )
@@ -1472,6 +1501,212 @@ class ResultStore:
             return _main_insight_row_to_pascal(row)
         return _mapping_to_jsonable(row)
 
+    async def get_current_period(self) -> dict[str, Any] | None:
+        """The reporting window the weekly refresh last applied, or None if never set."""
+        async with self._sf() as session:
+            row = (
+                await session.execute(
+                    select(portal_current_period_table).where(
+                        portal_current_period_table.c.id == 1
+                    )
+                )
+            ).mappings().first()
+        return _mapping_to_jsonable(row) if row is not None else None
+
+    async def set_current_period(
+        self, period_start: date, period_end: date, period_label: str | None = None
+    ) -> None:
+        """Upsert the single current-period row (id=1)."""
+        values = {
+            "id": 1,
+            "period_start": period_start,
+            "period_end": period_end,
+            "period_label": period_label,
+            "updated_at": datetime.now(timezone.utc),
+        }
+        async with self._sf() as session:
+            stmt = insert(portal_current_period_table).values(**values)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[portal_current_period_table.c.id],
+                set_={
+                    "period_start": stmt.excluded.period_start,
+                    "period_end": stmt.excluded.period_end,
+                    "period_label": stmt.excluded.period_label,
+                    "updated_at": stmt.excluded.updated_at,
+                },
+            )
+            await session.execute(stmt)
+            await session.commit()
+
+    async def update_all_signal_job_periods(
+        self, period_start: date, period_end: date
+    ) -> int:
+        """Set filters.period.{start,end} on every config_signaljobsrenuitycrm row.
+
+        Mirrors the hand-run jsonb_set UPDATE: preserves any other keys under
+        ``filters`` and creates ``filters``/``filters.period`` when absent. Returns
+        rows affected.
+        """
+        sql = text(
+            f"""
+            UPDATE {SCHEMA}.config_signaljobsrenuitycrm
+            SET filters = jsonb_set(
+                    jsonb_set(
+                        COALESCE(filters::jsonb, '{{}}'::jsonb),
+                        '{{period,start}}', to_jsonb(cast(:start AS text)), true
+                    ),
+                    '{{period,end}}', to_jsonb(cast(:end AS text)), true
+                ),
+                updated_at = NOW()
+            """
+        )
+        async with self._sf() as session:
+            result = await session.execute(
+                sql, {"start": period_start.isoformat(), "end": period_end.isoformat()}
+            )
+            await session.commit()
+        return int(result.rowcount or 0)
+
+    async def list_sales_reps_with_signals(self, *, min_signals: int = 1) -> list[dict[str, Any]]:
+        """Sales reps present in signal_log, with their signal counts, busiest first."""
+        async with self._sf() as session:
+            stmt = (
+                select(
+                    signal_log_table.c.dimension_value.label("sales_rep"),
+                    func.count().label("signal_count"),
+                )
+                .where(signal_log_table.c.dimension == "sales_rep")
+                .where(func.trim(signal_log_table.c.dimension_value) != "")
+                .group_by(signal_log_table.c.dimension_value)
+                .having(func.count() >= max(1, min_signals))
+                .order_by(desc(func.count()))
+            )
+            rows = (await session.execute(stmt)).mappings().all()
+        return [{"sales_rep": r["sales_rep"], "signal_count": int(r["signal_count"])} for r in rows]
+
+    async def list_sales_rep_signals(
+        self, sales_rep: str, *, kpi_names: set[str] | None = None, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        """signal_log rows for one rep, newest first, optionally scoped to a KPI set."""
+        key = (sales_rep or "").strip()
+        if not key:
+            return []
+        async with self._sf() as session:
+            stmt = (
+                select(
+                    signal_log_table.c.kpi_name,
+                    signal_log_table.c.signal_name,
+                    signal_log_table.c.severity,
+                    signal_log_table.c.current_kpi_value,
+                    signal_log_table.c.prev_kpi_value,
+                    signal_log_table.c.observed_value,
+                    signal_log_table.c.feature_name,
+                    signal_log_table.c.detected_at,
+                )
+                .where(signal_log_table.c.dimension == "sales_rep")
+                .where(func.lower(func.trim(signal_log_table.c.dimension_value)) == key.lower())
+            )
+            if kpi_names:
+                stmt = stmt.where(signal_log_table.c.kpi_name.in_(sorted(kpi_names)))
+            stmt = stmt.order_by(desc(signal_log_table.c.detected_at)).limit(max(1, min(limit, 5000)))
+            rows = (await session.execute(stmt)).mappings().all()
+        return [_mapping_to_jsonable(r) for r in rows]
+
+    async def get_finalcrmsalesrep(
+        self, sales_rep: str, group_name: str
+    ) -> dict[str, Any] | None:
+        """Precomputed executive summary for one (rep, KPI-card group), or None."""
+        rep = (sales_rep or "").strip()
+        grp = (group_name or "").strip().lower()
+        if not rep or not grp:
+            return None
+        async with self._sf() as session:
+            stmt = select(finalcrmsalesrep_table).where(
+                func.lower(finalcrmsalesrep_table.c.sales_rep) == rep.lower(),
+                func.lower(finalcrmsalesrep_table.c.group_name) == grp,
+            )
+            row = (await session.execute(stmt)).mappings().first()
+        return _mapping_to_jsonable(row) if row is not None else None
+
+    async def upsert_finalcrmsalesrep(
+        self,
+        sales_rep: str,
+        group_name: str,
+        *,
+        executive_summary: list[str] | None,
+        insight: dict[str, Any] | None,
+        recommended_action: str | None,
+        signal_count: int | None = None,
+    ) -> None:
+        """Write one precomputed rep summary. Values are served verbatim on read."""
+        rep = (sales_rep or "").strip()
+        grp = (group_name or "").strip().lower()
+        if not rep or not grp:
+            raise ValueError("sales_rep and group_name are required")
+        values = {
+            "sales_rep": rep,
+            "group_name": grp,
+            "executive_summary": executive_summary,
+            "insight": insight,
+            "recommended_action": recommended_action,
+            "signal_count": signal_count,
+            "updated_at": datetime.now(timezone.utc),
+        }
+        async with self._sf() as session:
+            stmt = insert(finalcrmsalesrep_table).values(**values)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[
+                    finalcrmsalesrep_table.c.sales_rep,
+                    finalcrmsalesrep_table.c.group_name,
+                ],
+                set_={
+                    "executive_summary": stmt.excluded.executive_summary,
+                    "insight": stmt.excluded.insight,
+                    "recommended_action": stmt.excluded.recommended_action,
+                    "signal_count": stmt.excluded.signal_count,
+                    "updated_at": stmt.excluded.updated_at,
+                },
+            )
+            await session.execute(stmt)
+            await session.commit()
+
+    async def upsert_finalcrm(
+        self,
+        group_name: str,
+        *,
+        executive_summary: list[str] | None,
+        insight: dict[str, Any] | None,
+        recommended_action: str | None,
+    ) -> None:
+        """Write one precomputed executive-summary row, keyed by group.
+
+        Counterpart to :meth:`get_finalcrm_by_group`, which serves these rows verbatim
+        (no normalizer runs on reads), so callers must supply display-ready values.
+        """
+        key = (group_name or "").strip().lower()
+        if not key:
+            raise ValueError("group_name is required")
+        values = {
+            "group_name": key,
+            "executive_summary": executive_summary,
+            "insight": insight,
+            "recommended_action": recommended_action,
+            "updated_at": datetime.now(timezone.utc),
+        }
+        async with self._sf() as session:
+            stmt = insert(finalcrm_table).values(**values)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[finalcrm_table.c.group_name],
+                set_={
+                    "executive_summary": stmt.excluded.executive_summary,
+                    "insight": stmt.excluded.insight,
+                    "recommended_action": stmt.excluded.recommended_action,
+                    "updated_at": stmt.excluded.updated_at,
+                },
+            )
+            await session.execute(stmt)
+            await session.commit()
+
     async def get_finalcrm_by_group(self, group_name: str) -> dict[str, Any] | None:
         """Precomputed executive summary row for a KPI-card group, or None."""
         key = (group_name or "").strip().lower()
@@ -1598,6 +1833,79 @@ class ResultStore:
             stmt = stmt.order_by(desc(mi_table.c.created_at)).limit(cap)
             result = await session.execute(stmt)
             return [dict(r) for r in result.mappings().all()]
+
+    async def backfill_group_names(
+        self,
+        *,
+        run_timestamp: datetime | None = None,
+        overwrite: bool = True,
+        clear_unmapped: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Set ``group_name`` from PORTAL_KPI_GROUPS for each row's ``kpi``.
+
+        ``write_main_insights`` does not map this column, so rows land ungrouped and
+        every KPI-card summary then matches zero insights. One UPDATE per distinct
+        tag rather than per row. Returns a summary; nothing is written on dry_run.
+        """
+        from ..engine.portal_kpi_groups import group_tag_for_kpis
+
+        mi_table = self._main_insights_table()
+        async with self._sf() as session:
+            sel = select(
+                mi_table.c.insight_id,
+                mi_table.c.kpi,
+                mi_table.c.kpi_family,
+                mi_table.c.group_name,
+            )
+            if run_timestamp is not None:
+                sel = sel.where(mi_table.c.run_timestamp == run_timestamp)
+            rows = (await session.execute(sel)).mappings().all()
+
+            by_tag: dict[str | None, list[PyUUID]] = {}
+            unmapped: set[str] = set()
+            for r in rows:
+                raw_kpi = r["kpi"] or r["kpi_family"]
+                want = group_tag_for_kpis(raw_kpi)
+                if want is None:
+                    unmapped.add(str(raw_kpi or ""))
+                    if not clear_unmapped:
+                        continue
+                if not overwrite and r["group_name"]:
+                    continue
+                if (r["group_name"] or None) == want:
+                    continue
+                by_tag.setdefault(want, []).append(r["insight_id"])
+
+            changed = sum(len(v) for v in by_tag.values())
+            if not dry_run:
+                for tag, ids in by_tag.items():
+                    await session.execute(
+                        update(mi_table)
+                        .where(mi_table.c.insight_id.in_(ids))
+                        .values(group_name=tag)
+                    )
+                await session.commit()
+
+        logger.info(
+            "backfill_group_names | scanned=%s changed=%s dry_run=%s unmapped=%s",
+            len(rows),
+            changed,
+            dry_run,
+            sorted(unmapped),
+        )
+        return {
+            "scanned": len(rows),
+            "changed": changed,
+            "dry_run": dry_run,
+            "by_group": {
+                (tag or "NULL"): len(ids)
+                for tag, ids in sorted(
+                    by_tag.items(), key=lambda kv: (kv[0] is None, kv[0] or "")
+                )
+            },
+            "unmapped_kpis": sorted(unmapped),
+        }
 
     async def update_main_insight_why(self, insight_id: PyUUID, why: str) -> int:
         """Persist summarized ``why`` text. Returns rows affected (0 or 1)."""

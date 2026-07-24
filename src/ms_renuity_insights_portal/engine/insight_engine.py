@@ -4945,6 +4945,109 @@ class InsightEngine:
             return None
         return _normalize_group_highlight(parsed)
 
+    def _build_sales_rep_signal_blocks(self, rows: list[dict]) -> list[str]:
+        """One block per rep signal. Rep-level data lives in signal_log, not main_insights."""
+        blocks: list[str] = []
+        for i, row in enumerate(rows, start=1):
+            kpi = (row.get("kpi_name") or "").strip()
+            if not kpi:
+                continue
+            cur = row.get("current_kpi_value")
+            prev = row.get("prev_kpi_value")
+            change = ""
+            try:
+                if prev not in (None, "") and float(prev) != 0 and cur not in (None, ""):
+                    pct = (float(cur) - float(prev)) / abs(float(prev)) * 100.0
+                    change = f"{pct:+.1f}%"
+            except (TypeError, ValueError):
+                change = ""
+            blocks.append(
+                f"--- Signal {i} ---\n"
+                f"KPI: {kpi}\n"
+                f"Signal: {(row.get('signal_name') or '').strip()}\n"
+                f"Current: {cur}\n"
+                f"Previous: {prev}\n"
+                f"Change: {change or 'n/a'}\n"
+                f"Severity: {(row.get('severity') or '').strip()}\n"
+            )
+        return blocks
+
+    async def summarize_sales_rep_executive(
+        self,
+        *,
+        sales_rep: str,
+        group: str | None = None,
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        """Executive summary for one sales rep, built from their signal_log rows.
+
+        ``maininsightscrm`` holds no dimension_name='sales_rep' rows, so the rep
+        narrative cannot come from the main-insights path; signals are the source.
+        When ``group`` is given, only that card's KPIs feed the summary.
+        """
+        from .portal_kpi_groups import resolve_group_kpis
+
+        rep = (sales_rep or "").strip()
+        if not rep:
+            raise ValueError("sales_rep is required")
+        try:
+            kpi_set = resolve_group_kpis(group)
+        except KeyError as e:
+            raise ValueError(f"unknown group: {group}") from e
+
+        rows = await self.store.list_sales_rep_signals(rep, kpi_names=kpi_set, limit=limit)
+        base: dict[str, Any] = {
+            "sales_rep": rep,
+            "group": group,
+            "signal_count": len(rows),
+            "pointers": [],
+        }
+        blocks = self._build_sales_rep_signal_blocks(rows)
+        if not blocks:
+            return base
+
+        scope = f"KPI group {group}" if group else "all KPIs"
+        user_prompt = (
+            f"Sales rep: {rep}\n"
+            f"Scope: {scope}\n"
+            f"Signals: {len(rows)}\n\n" + "\n".join(blocks)
+        )
+        raw = await self._call_gpt4o(
+            _EXECUTIVE_SUMMARY_COLORED_SYSTEM_PROMPT,
+            user_prompt,
+            context=f"sales_rep_summary_{rep}",
+            max_tokens=1000,
+            temperature=0.2,
+            prompt_log_category="main_insight",
+            prompt_log_subfolder="sales_rep_summary",
+        )
+        parsed = _parse_narrative_json(raw)
+        base["pointers"] = _normalize_executive_pointers_colored(parsed.get("pointers"))
+
+        if group:
+            highlight_prompt = (
+                f"Sales rep {rep}, KPI group {group}. Synthesize ALL of these signals into one.\n\n"
+                + "\n".join(blocks)
+            )
+            raw2 = await self._call_gpt4o(
+                _GROUP_HIGHLIGHT_SYSTEM_PROMPT,
+                highlight_prompt,
+                context=f"sales_rep_highlight_{rep}",
+                max_tokens=600,
+                temperature=0.2,
+                prompt_log_category="main_insight",
+                prompt_log_subfolder="sales_rep_highlight",
+            )
+            try:
+                highlight = _normalize_group_highlight(_parse_narrative_json(raw2))
+            except Exception:
+                logger.exception("Sales-rep highlight JSON parse failed (%s / %s).", rep, group)
+                highlight = None
+            if highlight:
+                base["best_insight"] = highlight["best_insight"]
+                base["recommended_action"] = highlight["recommended_action"]
+        return base
+
     async def _executive_summary_for_rows(
         self,
         rows: list[dict],

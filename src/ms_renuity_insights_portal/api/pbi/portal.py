@@ -36,6 +36,7 @@ from ...engine.portal_period import (
     split_portal_insight_rows,
 )
 from ...engine.insight_breakdown import fetch_insight_breakdown
+from ...engine.portal_kpi_groups import PORTAL_KPI_GROUPS
 from ...store.result_store import MAIN_INSIGHTS_TABLE_QUERY_HELP, ResultStore
 from ..dependencies import get_config_loader, get_dax_settings, get_pbi_client, get_result_store
 
@@ -269,6 +270,74 @@ class FinalSummaryResponse(BaseModel):
         None, description="Synthesized group insight (heading wrapped in /h ... /h, plus description)."
     )
     recommended_action: Optional[str] = Field(None, description="One recommended action for the group.")
+
+
+class SalesRepSummaryResponse(BaseModel):
+    sales_rep: str = Field(..., description="Echo of the requested rep.")
+    group: Optional[str] = Field(None, description="Echo of the requested group, or null for overall.")
+    source: str = Field(
+        ...,
+        description="'stored' when read from insights.finalcrmsalesrep, 'generated' when built via LLM.",
+    )
+    signal_count: Optional[int] = Field(
+        None, description="Rep signals that fed this summary."
+    )
+    executive_summary: list[str] = Field(
+        default_factory=list,
+        description="Pointers, each carrying an inline /green or /red marker.",
+    )
+    insight: Optional[GroupBestInsight] = None
+    recommended_action: Optional[str] = None
+
+
+class SalesRepListItem(BaseModel):
+    sales_rep: str
+    signal_count: int
+
+
+class SalesRepRefreshItem(BaseModel):
+    sales_rep: str
+    group_name: str
+    signal_count: int
+    pointers: int
+
+
+class SalesRepRefreshResponse(BaseModel):
+    dry_run: bool
+    reps: int = Field(..., description="Reps processed.")
+    rows: int = Field(..., description="(rep, group) rows written.")
+    refreshed: list[SalesRepRefreshItem] = Field(default_factory=list)
+
+
+class FinalSummaryRefreshItem(BaseModel):
+    group_name: str = Field(..., description="Key written to insights.finalcrm.")
+    insight_count: int = Field(..., description="Main-insights rows that fed this summary.")
+    pointers: list[str] = Field(default_factory=list)
+    insight: Optional[GroupBestInsight] = None
+    recommended_action: Optional[str] = None
+
+
+class FinalSummaryRefreshResponse(BaseModel):
+    run_timestamp: Optional[datetime] = None
+    dry_run: bool = Field(..., description="True when nothing was written.")
+    refreshed: list[FinalSummaryRefreshItem] = Field(default_factory=list)
+
+
+class GroupNameBackfillResponse(BaseModel):
+    run_timestamp: Optional[datetime] = Field(
+        None, description="Batch that was updated, or null when all runs were."
+    )
+    scanned: int = Field(..., description="Rows examined.")
+    changed: int = Field(..., description="Rows whose group_name was set to a new value.")
+    dry_run: bool = Field(..., description="True when nothing was written.")
+    by_group: dict[str, int] = Field(
+        default_factory=dict,
+        description="Rows changed per resulting tag; 'NULL' counts rows cleared.",
+    )
+    unmapped_kpis: list[str] = Field(
+        default_factory=list,
+        description="KPIs no card claims. Left untouched unless clear_unmapped=true.",
+    )
 
 
 @router.get(
@@ -740,6 +809,400 @@ async def post_main_insights_executive_summary(
         insight=GroupBestInsight(**ins) if isinstance(ins, dict) else None,
         recommended_action=bucket.get("recommended_action"),
     )
+
+
+class CurrentPeriodResponse(BaseModel):
+    period_start: str = Field(..., description="Inclusive window start, YYYY-MM-DD.")
+    period_end: str = Field(..., description="Inclusive window end, YYYY-MM-DD.")
+    period_label: Optional[str] = Field(None, description="Human label, e.g. '15-21 Jul'.")
+    updated_at: Optional[datetime] = None
+
+
+@router.get(
+    "/current-period",
+    response_model=CurrentPeriodResponse,
+    summary="Current reporting window applied by the weekly refresh",
+    description=(
+        "The reporting window the weekly refresh job last applied, from "
+        "**insights.portal_current_period**. The frontend reads this at runtime instead of "
+        "hardcoding the KPI-card window, so refreshing the period needs no frontend redeploy.\n\n"
+        "`404` until the first refresh has run."
+    ),
+)
+async def get_current_period(store: ResultStore = Depends(get_result_store)):
+    """Serve the current reporting window for the frontend."""
+    try:
+        row = await store.get_current_period()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    if not row:
+        raise HTTPException(
+            status_code=404, detail="No current period set yet; the weekly refresh has not run."
+        )
+    return CurrentPeriodResponse(
+        period_start=str(row["period_start"]),
+        period_end=str(row["period_end"]),
+        period_label=row.get("period_label"),
+        updated_at=row.get("updated_at"),
+    )
+
+
+@router.get(
+    "/main-insights/sales-reps",
+    response_model=list[SalesRepListItem],
+    summary="Sales reps that have signals, busiest first",
+    description=(
+        "Reps present in **insights.signal_log** under `dimension='sales_rep'`, with their "
+        "signal counts. Use this to drive a rep picker; it is the population the rep-level "
+        "executive summaries are built from."
+    ),
+)
+async def get_sales_reps(
+    min_signals: int = Query(1, ge=1, description="Only reps with at least this many signals."),
+    store: ResultStore = Depends(get_result_store),
+):
+    """Reps available for rep-level executive summaries."""
+    try:
+        rows = await store.list_sales_reps_with_signals(min_signals=min_signals)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return [SalesRepListItem(**r) for r in rows if (r["sales_rep"] or "").strip()]
+
+
+@router.post(
+    "/main-insights/executive-summary/sales-rep",
+    response_model=SalesRepSummaryResponse,
+    summary="Executive summary per sales rep (stored in insights.finalcrmsalesrep, LLM fallback)",
+    description=(
+        "Returns the precomputed executive summary for one **sales rep**, optionally scoped to a "
+        "KPI-card group, from **insights.finalcrmsalesrep** (keyed by rep + group; 'overall' for "
+        "no group). ``source='stored'`` when served from the table (no LLM call).\n\n"
+        "When no row exists, falls back to generating from the rep's **signal_log** rows "
+        "(``source='generated'``) — rep-level data does not exist in maininsightscrm.\n\n"
+        "Response mirrors the group executive summary: ``executive_summary`` (pointers with "
+        "/green|/red markers), ``insight`` (heading in /h ... /h + description), ``recommended_action``."
+    ),
+)
+async def post_sales_rep_executive_summary(
+    sales_rep: str = Query(..., description="Rep name, e.g. `Uday Singh`. Matched case-insensitively."),
+    group: Optional[str] = Query(
+        None,
+        description="KPI-card group to scope to, e.g. group1..group5. Omit for the rep's overall summary.",
+    ),
+    limit: int = Query(500, ge=1, le=5000, description="Max rep signals to load."),
+    store: ResultStore = Depends(get_result_store),
+):
+    """Executive summary for one sales rep."""
+    rep = (sales_rep or "").strip()
+    if not rep:
+        raise HTTPException(status_code=400, detail="sales_rep is required")
+    group_val = (group or "").strip() or None
+    if group_val and group_val.lower() not in PORTAL_KPI_GROUPS:
+        raise HTTPException(status_code=400, detail=f"unknown group: {group_val}")
+    lookup_key = group_val or "overall"
+    logger.info(
+        "POST /pbi/portal/main-insights/executive-summary/sales-rep rep=%s group=%s (lookup=%s)",
+        rep,
+        group_val,
+        lookup_key,
+    )
+
+    # 1) Stored (no LLM call).
+    try:
+        stored = await store.get_finalcrmsalesrep(rep, lookup_key)
+    except Exception:
+        stored = None
+    if stored and any(
+        stored.get(k) for k in ("executive_summary", "insight", "recommended_action")
+    ):
+        es = stored.get("executive_summary")
+        ins = stored.get("insight")
+        return SalesRepSummaryResponse(
+            sales_rep=stored.get("sales_rep") or rep,
+            group=group_val,
+            source="stored",
+            signal_count=stored.get("signal_count"),
+            executive_summary=es if isinstance(es, list) else [],
+            insight=GroupBestInsight(**ins) if isinstance(ins, dict) else None,
+            recommended_action=stored.get("recommended_action"),
+        )
+
+    # 2) LLM fallback — generate from the rep's signals.
+    try:
+        engine = InsightEngine(store, main_insights_llm=MainInsightsNarrativeModel.azure_default)
+        result = await engine.summarize_sales_rep_executive(
+            sales_rep=rep, group=group_val, limit=limit
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    ins = result.get("best_insight")
+    return SalesRepSummaryResponse(
+        sales_rep=rep,
+        group=group_val,
+        source="generated",
+        signal_count=int(result.get("signal_count") or 0),
+        executive_summary=result.get("pointers", []),
+        insight=GroupBestInsight(**ins) if isinstance(ins, dict) else None,
+        recommended_action=result.get("recommended_action"),
+    )
+
+
+@router.post(
+    "/main-insights/executive-summary/sales-rep/refresh",
+    response_model=SalesRepRefreshResponse,
+    summary="Regenerate insights.finalcrmsalesrep from signal_log",
+    description=(
+        "Runs the Azure GPT-4o generator per (rep, group) and upserts into "
+        "**insights.finalcrmsalesrep** so later reads are served as ``source='stored'``.\n\n"
+        "Expensive: two GPT-4o calls per group row plus one per rep 'overall'. Scope it with "
+        "`sales_reps`, `groups` and `min_signals`, or preview with `dry_run=true`."
+    ),
+)
+async def post_sales_rep_executive_summary_refresh(
+    sales_reps: Optional[str] = Query(
+        None, description="Comma-separated rep names. Defaults to every rep meeting min_signals."
+    ),
+    groups: Optional[str] = Query(
+        None, description="Comma-separated keys, e.g. `group1,overall`. Defaults to group1..group5 plus 'overall'."
+    ),
+    min_signals: int = Query(1, ge=1, description="Skip reps with fewer signals than this."),
+    limit: int = Query(500, ge=1, le=5000, description="Max rep signals to load per call."),
+    dry_run: bool = Query(False, description="Report what would be written without calling the LLM."),
+    store: ResultStore = Depends(get_result_store),
+):
+    """Regenerate and store rep-level executive summaries."""
+    try:
+        available = await store.list_sales_reps_with_signals(min_signals=min_signals)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    counts = {r["sales_rep"]: r["signal_count"] for r in available if (r["sales_rep"] or "").strip()}
+
+    wanted = [r.strip() for r in (sales_reps or "").split(",") if r.strip()]
+    reps = wanted or sorted(counts, key=lambda k: -counts[k])
+    unknown = [r for r in reps if r not in counts]
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"no signals for: {', '.join(unknown)}")
+
+    keys = [g.strip().lower() for g in (groups or "").split(",") if g.strip()] or [
+        *PORTAL_KPI_GROUPS.keys(),
+        "overall",
+    ]
+    bad = [k for k in keys if k != "overall" and k not in PORTAL_KPI_GROUPS]
+    if bad:
+        raise HTTPException(status_code=400, detail=f"unknown group(s): {', '.join(bad)}")
+
+    engine = InsightEngine(store, main_insights_llm=MainInsightsNarrativeModel.azure_default)
+    out: list[SalesRepRefreshItem] = []
+    for rep in reps:
+        for key in keys:
+            group_val = None if key == "overall" else key
+            if dry_run:
+                out.append(
+                    SalesRepRefreshItem(
+                        sales_rep=rep, group_name=key, signal_count=counts[rep], pointers=0
+                    )
+                )
+                continue
+            try:
+                result = await engine.summarize_sales_rep_executive(
+                    sales_rep=rep, group=group_val, limit=limit
+                )
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"{rep}/{key}: {e}") from e
+            pointers = result.get("pointers") or []
+            ins = result.get("best_insight")
+            await store.upsert_finalcrmsalesrep(
+                rep,
+                key,
+                executive_summary=pointers,
+                insight=ins if isinstance(ins, dict) else None,
+                recommended_action=result.get("recommended_action"),
+                signal_count=int(result.get("signal_count") or 0),
+            )
+            out.append(
+                SalesRepRefreshItem(
+                    sales_rep=rep,
+                    group_name=key,
+                    signal_count=int(result.get("signal_count") or 0),
+                    pointers=len(pointers),
+                )
+            )
+    logger.info(
+        "finalcrmsalesrep refresh | reps=%s rows=%s dry_run=%s", len(reps), len(out), dry_run
+    )
+    return SalesRepRefreshResponse(
+        dry_run=dry_run, reps=len(reps), rows=len(out), refreshed=out
+    )
+
+
+@router.post(
+    "/main-insights/executive-summary/refresh",
+    response_model=FinalSummaryRefreshResponse,
+    summary="Regenerate insights.finalcrm from current main-insights rows",
+    description=(
+        "Runs the same Azure GPT-4o generator the executive-summary endpoint falls back "
+        "to, once per KPI-card group, and upserts the result into **insights.finalcrm** "
+        "so later reads are served as ``source='stored'`` with no LLM call.\n\n"
+        "Run this after loading a new batch of main-insights rows — stored rows win over "
+        "generation, so a stale finalcrm is served indefinitely otherwise.\n\n"
+        "Costs two GPT-4o calls per group (pointers + heading/action), one for 'overall' "
+        "(pointers only, matching the generated path). Pass `dry_run=true` to preview "
+        "without writing."
+    ),
+)
+async def post_main_insights_executive_summary_refresh(
+    groups: Optional[str] = Query(
+        None,
+        description=(
+            "Comma-separated keys to refresh, e.g. `group1,group5`. "
+            "Defaults to group1..group5 plus 'overall'."
+        ),
+    ),
+    period_type: PeriodTypeQuery = None,
+    run_timestamp: Optional[datetime] = Query(
+        None, description="Batch to summarize. Defaults to the latest main-insights run."
+    ),
+    limit: int = Query(500, ge=1, le=5000, description="Max main-insights rows to load."),
+    dry_run: bool = Query(False, description="Generate and return without writing."),
+    main_insights_table: Optional[str] = Query(
+        None,
+        description=MAIN_INSIGHTS_TABLE_QUERY_HELP,
+    ),
+    store: ResultStore = Depends(get_result_store),
+):
+    """Regenerate and store the executive summary for each KPI-card group."""
+    store = _select_main_insights_store(store, main_insights_table)
+    keys = [g.strip().lower() for g in (groups or "").split(",") if g.strip()] or [
+        *PORTAL_KPI_GROUPS.keys(),
+        "overall",
+    ]
+    pt = period_type.value if period_type else None
+    engine = InsightEngine(store, main_insights_llm=MainInsightsNarrativeModel.azure_default)
+
+    refreshed: list[FinalSummaryRefreshItem] = []
+    for key in keys:
+        group_val = None if key == "overall" else key
+        try:
+            result = await engine.summarize_main_insights_executive_split(
+                run_timestamp=run_timestamp,
+                limit=limit,
+                period_type=pt,
+                group=group_val,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"{key}: {e}") from e
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"{key}: {e}") from e
+
+        bucket = (
+            result.get("monthly") if pt == "monthly" else result.get("weekly")
+        ) or result.get("weekly") or result.get("monthly") or {}
+        pointers = bucket.get("pointers") or []
+        ins = bucket.get("best_insight")
+        action = bucket.get("recommended_action")
+        if not dry_run:
+            await store.upsert_finalcrm(
+                key,
+                executive_summary=pointers,
+                insight=ins if isinstance(ins, dict) else None,
+                recommended_action=action,
+            )
+        refreshed.append(
+            FinalSummaryRefreshItem(
+                group_name=key,
+                insight_count=int(bucket.get("insight_count") or 0),
+                pointers=pointers,
+                insight=GroupBestInsight(**ins) if isinstance(ins, dict) else None,
+                recommended_action=action,
+            )
+        )
+        logger.info(
+            "finalcrm refresh | group=%s insights=%s pointers=%s dry_run=%s",
+            key,
+            bucket.get("insight_count"),
+            len(pointers),
+            dry_run,
+        )
+
+    return FinalSummaryRefreshResponse(
+        run_timestamp=result.get("run_timestamp"),
+        dry_run=dry_run,
+        refreshed=refreshed,
+    )
+
+
+@router.post(
+    "/main-insights/backfill-group-names",
+    response_model=GroupNameBackfillResponse,
+    summary="Set group_name on main-insights rows from the KPI-card group map",
+    description=(
+        "Fills the manual **group_name** column from `PORTAL_KPI_GROUPS`, matching each "
+        "row's `kpi` (falling back to `kpi_family`) to the cards that name it. "
+        "`write_main_insights` does not map this column, so engine-written rows land "
+        "ungrouped and every group-scoped executive summary matches zero insights.\n\n"
+        "A KPI claimed by several cards gets a comma-separated tag (e.g. `group1,group4`), "
+        "which is what `row_in_group` reads back. KPIs in no card are reported under "
+        "`unmapped_kpis` and left untouched unless `clear_unmapped=true`.\n\n"
+        "Defaults to the latest run. Pass `dry_run=true` to preview the counts first."
+    ),
+)
+async def post_main_insights_backfill_group_names(
+    run_timestamp: Optional[datetime] = Query(
+        None,
+        description="Scope to one batch. Defaults to the latest run unless all_runs=true.",
+    ),
+    all_runs: bool = Query(
+        False, description="Update every run in the table instead of just the latest."
+    ),
+    overwrite: bool = Query(
+        True,
+        description="Replace existing group_name values. False only fills rows where it is null.",
+    ),
+    clear_unmapped: bool = Query(
+        False,
+        description="Set group_name to null for KPIs no card claims, instead of leaving them as-is.",
+    ),
+    dry_run: bool = Query(
+        False, description="Report what would change without writing."
+    ),
+    main_insights_table: Optional[str] = Query(
+        None,
+        description=MAIN_INSIGHTS_TABLE_QUERY_HELP,
+    ),
+    store: ResultStore = Depends(get_result_store),
+):
+    """Backfill ``group_name`` from the KPI-card group map."""
+    store = _select_main_insights_store(store, main_insights_table)
+    ts = run_timestamp
+    if ts is None and not all_runs:
+        ts = await store.get_latest_main_insight_run_timestamp()
+        if ts is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No main-insights rows found; nothing to backfill.",
+            )
+    logger.info(
+        "POST /pbi/portal/main-insights/backfill-group-names run_timestamp=%s "
+        "all_runs=%s overwrite=%s clear_unmapped=%s dry_run=%s",
+        ts,
+        all_runs,
+        overwrite,
+        clear_unmapped,
+        dry_run,
+    )
+    try:
+        result = await store.backfill_group_names(
+            run_timestamp=ts,
+            overwrite=overwrite,
+            clear_unmapped=clear_unmapped,
+            dry_run=dry_run,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return GroupNameBackfillResponse(run_timestamp=ts, **result)
 
 
 @router.get(

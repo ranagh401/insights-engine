@@ -123,6 +123,28 @@ def row_matches_group(row: dict, group_kpis: set[str]) -> bool:
     return bool(row_kpis & group_kpis)
 
 
+def groups_for_kpi(kpi: str | None) -> list[str]:
+    """Every group id whose KPI set names ``kpi``. Empty when no card claims it."""
+    key = (kpi or "").strip().lower()
+    if not key:
+        return []
+    return sorted(
+        g for g, kpis in PORTAL_KPI_GROUPS.items() if key in {k.lower() for k in kpis}
+    )
+
+
+def group_tag_for_kpis(raw: str | None) -> str | None:
+    """``group_name`` tag for a row's ``kpi`` value, which may be comma-separated.
+
+    Returns "group1", or "group1,group4" when several cards claim the KPI, or
+    None when none do. The inverse of what ``row_in_group`` reads back.
+    """
+    found: set[str] = set()
+    for part in str(raw or "").split(","):
+        found.update(groups_for_kpi(part))
+    return ",".join(sorted(found)) or None
+
+
 def _norm_group(value: str) -> str:
     """Normalize a group tag: lowercase, drop spaces (so 'Group 1' == 'group1')."""
     return "".join(str(value).split()).lower()
