@@ -47,6 +47,21 @@ async def list_kpis(db: AsyncSession = Depends(get_db)):
     return [_kpi_to_dict(r) for r in rows]
 
 
+# NOTE: declared before "/{kpi_name}" so the literal path wins route matching.
+@router.get("/descriptions", response_model=list[dict[str, Any]])
+async def list_kpi_descriptions(db: AsyncSession = Depends(get_db)):
+    """Description of each KPI in insights.configkpisrenuitycrm."""
+    result = await db.execute(
+        select(ConfigKPI.kpi_name, ConfigKPI.label, ConfigKPI.description).order_by(
+            ConfigKPI.kpi_name
+        )
+    )
+    return [
+        {"kpi_name": kpi_name, "label": label, "description": description or ""}
+        for kpi_name, label, description in result.all()
+    ]
+
+
 @router.get("/{kpi_name}", response_model=dict[str, Any])
 async def get_kpi(kpi_name: str, db: AsyncSession = Depends(get_db)):
     row = await db.get(ConfigKPI, kpi_name)
