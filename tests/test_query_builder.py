@@ -7,12 +7,12 @@ from datetime import date
 
 import pytest
 
-from ms_crm_insights_portal.config.models import (
+from insights_engine.config.models import (
     ConfigIncompleteError,
     DimensionRef,
     KPIConfig,
 )
-from ms_crm_insights_portal.dax.query_builder import DAXQueryBuilder
+from insights_engine.dax.query_builder import DAXQueryBuilder
 
 
 @pytest.fixture
@@ -202,6 +202,6 @@ class TestNullPbiMeasureRaisesError:
             if pbi_measure_name is None:
                 raise ConfigIncompleteError(
                     f"KPI '{kpi_name}' has no pbi_measure_name. "
-                    f"Populate configkpisclientcrm.pbi_measure_name "
+                    f"Populate configkpisclientportal.pbi_measure_name "
                     f"to use the DAX engine."
                 )

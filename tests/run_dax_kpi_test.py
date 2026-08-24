@@ -124,19 +124,19 @@ async def load_kpi_config(kpi_name: str) -> dict[str, Any]:
         # Try base KPIs first, then derived
         r = await conn.execute(text(
             f"SELECT kpiname, pbi_measure_name, label "
-            f"FROM {SCHEMA}.configkpisclientcrm WHERE kpiname = :kpi"
+            f"FROM {SCHEMA}.configkpisclientportal WHERE kpiname = :kpi"
         ), {"kpi": kpi_name})
         row = r.fetchone()
 
         if not row:
             r = await conn.execute(text(
                 f"SELECT kpiname, pbi_measure_name, label "
-                f"FROM {SCHEMA}.configderivedkpisclientcrm WHERE kpiname = :kpi"
+                f"FROM {SCHEMA}.configderivedkpisclientportal WHERE kpiname = :kpi"
             ), {"kpi": kpi_name})
             row = r.fetchone()
 
         if not row:
-            raise ValueError(f"KPI '{kpi_name}' not found in configkpisclientcrm or configderivedkpisclientcrm")
+            raise ValueError(f"KPI '{kpi_name}' not found in configkpisclientportal or configderivedkpisclientportal")
         if not row[1]:
             raise ValueError(f"KPI '{kpi_name}' has no pbi_measure_name. Run populate_pbi_columns.py first.")
 
@@ -146,8 +146,8 @@ async def load_kpi_config(kpi_name: str) -> dict[str, Any]:
         # Valid dimensions with PBI mapping
         r2 = await conn.execute(text(
             f"SELECT vd.dimensionname, d.pbi_table_name, d.pbi_column_name "
-            f"FROM {SCHEMA}.configkpivaliddimensionsclientcrm vd "
-            f"JOIN {SCHEMA}.config_dimensionsreunitycrm d ON d.dimensionname = vd.dimensionname "
+            f"FROM {SCHEMA}.configkpivaliddimensionsclientportal vd "
+            f"JOIN {SCHEMA}.config_dimensionsreunityportal d ON d.dimensionname = vd.dimensionname "
             f"WHERE vd.kpiname = :kpi AND vd.is_valid = true "
             f"AND d.pbi_table_name IS NOT NULL AND d.pbi_column_name IS NOT NULL "
             f"ORDER BY vd.dimensionname"
@@ -161,7 +161,7 @@ async def load_kpi_config(kpi_name: str) -> dict[str, Any]:
         # Dependencies
         r3 = await conn.execute(text(
             f"SELECT dependent_kpi, pbi_measure_name, label "
-            f"FROM {SCHEMA}.configkpidependenciesclientcrm "
+            f"FROM {SCHEMA}.configkpidependenciesclientportal "
             f"WHERE parent_kpi = :kpi AND pbi_measure_name IS NOT NULL "
             f"ORDER BY sort_order"
         ), {"kpi": kpi_name})
@@ -182,8 +182,8 @@ def build_query(
     dim: dict[str, str],
     product_dim: dict[str, str] | None = None,
 ) -> str:
-    from ms_crm_insights_portal.config.models import DimensionRef
-    from ms_crm_insights_portal.dax.query_builder import DAXQueryBuilder
+    from insights_engine.config.models import DimensionRef
+    from insights_engine.dax.query_builder import DAXQueryBuilder
 
     dim_ref = DimensionRef(
         dimension_name=dim["name"],
@@ -209,7 +209,7 @@ def build_query(
 # ── Step 2: Execute DAX ───────────────────────────────────────────────────────
 
 async def execute_dax(query: str) -> list[dict[str, Any]]:
-    from ms_crm_insights_portal.powerbi.api_client import PBIClient
+    from insights_engine.powerbi.api_client import PBIClient
 
     client = PBIClient(
         tenant_id=AZURE_TENANT_ID,
@@ -231,8 +231,8 @@ async def execute_dax(query: str) -> list[dict[str, Any]]:
 def parse_rows(
     raw_rows: list[dict[str, Any]], dim: dict[str, str]
 ) -> list[dict[str, Any]]:
-    from ms_crm_insights_portal.config.models import DimensionRef
-    from ms_crm_insights_portal.engine.kpi_engine import (
+    from insights_engine.config.models import DimensionRef
+    from insights_engine.engine.kpi_engine import (
         _extract_dim_value,
         _extract_measure_value,
     )
@@ -303,9 +303,9 @@ async def _run_feature_test(
 ) -> None:
     """Quick smoke test: fetch current period data and compute rank + mix features."""
     import numpy as np
-    from ms_crm_insights_portal.config.models import DimensionRef
-    from ms_crm_insights_portal.dax.query_builder import DAXQueryBuilder
-    from ms_crm_insights_portal.definitions.features import (
+    from insights_engine.config.models import DimensionRef
+    from insights_engine.dax.query_builder import DAXQueryBuilder
+    from insights_engine.definitions.features import (
         calculate_rank,
         calculate_rank_pct,
         calculate_region_mix,

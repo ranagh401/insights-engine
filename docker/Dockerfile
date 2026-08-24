@@ -53,4 +53,4 @@ COPY --chown=app:app --from=builder /app/src /app/src
 
 EXPOSE 8016
 
-CMD ["uvicorn", "src.ms_crm_insights_portal.main:app", "--host", "0.0.0.0", "--port", "8016"]
+CMD ["uvicorn", "src.insights_engine.main:app", "--host", "0.0.0.0", "--port", "8016"]

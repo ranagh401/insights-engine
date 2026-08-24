@@ -3,9 +3,9 @@ requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ms-insights-crm-pbi-dax-engine"
+name = "insights-engine"
 version = "1.0.0"
-description = "MS Insights CRM — dedicated fork of the Client PBI DAX engine for CRM-only deployments."
+description = "Config-driven insights engine: Power BI DAX KPIs, signal detection, why-analysis, and LLM narratives."
 requires-python = ">=3.12"
 dependencies = [
     "fastapi==0.112.0",
@@ -36,8 +36,8 @@ dependencies = [
 ]
 
 [project.scripts]
-crm-insights-serve = "ms_crm_insights_portal.main:main"
-pbi-engine-serve = "ms_crm_insights_portal.main:main"
+insights-serve = "insights_engine.main:main"
+pbi-engine-serve = "insights_engine.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -96,7 +96,7 @@ run:
 # Run the service with hot reload for development
 dev-server:
 	@echo "Starting insights service with hot reload..."
-	$(UVICORN) --app-dir src ms_crm_insights_portal.app:app --host 0.0.0.0 --port 8009 --reload
+	$(UVICORN) --app-dir src insights_engine.app:app --host 0.0.0.0 --port 8009 --reload
 
 # Run tests
 test:

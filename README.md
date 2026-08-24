@@ -1,6 +1,6 @@
-# CRM Insights Engine
+# Insights Engine
 
-FastAPI service that turns a CRM Power BI dataset into narrative business insights: it computes KPIs with generated DAX, detects signals (anomalies, trends, threshold breaches) across dimensions, drills into *why* they happened, and writes LLM-generated narrative insights back to the database.
+FastAPI service that turns a Power BI dataset into narrative business insights: it computes KPIs with generated DAX, detects signals (anomalies, trends, threshold breaches) across dimensions, drills into *why* they happened, and writes LLM-generated narrative insights back to the database.
 
 ## How it works
 
@@ -26,7 +26,7 @@ Routes are under `/pbi` (Swagger at `/docs`):
 ```bash
 pip install -e .
 cp .env.example .env   # fill in your values
-python main.py         # or: crm-insights-serve
+python main.py         # or: insights-serve
 ```
 
 Swagger: http://localhost:8014/docs (port from `PLATFORM_SERVICE__PORT`).
@@ -42,7 +42,7 @@ Key configuration (see `.env.example` for the full annotated list):
 
 | Path | Purpose |
 | --- | --- |
-| `src/ms_crm_insights_portal/` | The service: API, config, DAX builder, engines, models, scheduler |
+| `src/insights_engine/` | The service: API, config, DAX builder, engines, models, scheduler |
 | `src/platform_core/` | Shared platform plumbing: settings, auth/JWT, DB, observability |
 | `scripts/weekly_refresh_cron.py` | Weekly end-to-end refresh entry point |
 | `docker/Dockerfile` | Container build |
