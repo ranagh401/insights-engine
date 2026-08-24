@@ -1,0 +1,1 @@
+"""Shared-style configuration helpers."""

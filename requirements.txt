@@ -1,0 +1,54 @@
+# ── Core web framework ────────────────────────────────────────────────────────
+fastapi>=0.112.0
+uvicorn[standard]
+
+# ── Data validation & settings ────────────────────────────────────────────────
+pydantic[email]>=2.10.0
+pydantic-settings>=2.8.0
+
+# ── Database (PostgreSQL async) ───────────────────────────────────────────────
+sqlalchemy[asyncio]>=2.0.36
+psycopg[binary,pool]
+psycopg2-binary
+asyncpg
+
+# ── Caching ───────────────────────────────────────────────────────────────────
+cachetools>=5.3.0
+
+# ── HTTP clients ──────────────────────────────────────────────────────────────
+httpx>=0.27.0
+requests>=2.31.0
+aiohttp>=3.9.0
+
+# ── Azure authentication (Service Principal → Power BI) ──────────────────────
+azure-identity>=1.15.0
+
+# ── Azure OpenAI (InsightEngine / AsyncAzureOpenAI) ───────────────────────────
+openai>=1.51.0
+
+# ── Data processing ──────────────────────────────────────────────────────────
+pandas>=2.2.3
+numpy>=1.26.4
+python-dateutil>=2.8.0
+
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+apscheduler>=3.10.0
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+structlog>=25.1.0
+
+# ── Auth / JWT ────────────────────────────────────────────────────────────────
+python-jose[cryptography]>=3.3.0
+
+# ── Environment & config ─────────────────────────────────────────────────────
+python-dotenv>=1.0.0
+
+# ── Databricks REST API (signal writes) ──────────────────────────────────────
+pyodbc>=5.1.0
+
+# ── Messaging (retained for platform_core compat) ─────────────────────────
+aio-pika>=9.3.0
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
